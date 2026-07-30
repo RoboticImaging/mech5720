@@ -556,7 +556,7 @@ def main():
         
         imgui.text("Actions")
         
-        if imgui.button("Capture Raw Frame"):
+        if imgui.button("Capture Debug Data"):
             def grab():
                 set_status("Downloading raw frame...", (0.9, 0.6, 0.2, 1.0))
                 try:
