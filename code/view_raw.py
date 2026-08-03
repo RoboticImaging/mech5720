@@ -12,9 +12,9 @@ def main():
 
     try:
         # Load and view the raw bayer image
-        with rawpy.imread(filename) as raw:
+        raw = rawpy.imread(filename)
 
-            rgb = raw.raw_image
+        rgb = raw.raw_image
 
         # Display using Matplotlib
         plt.figure(figsize=(10, 6))
