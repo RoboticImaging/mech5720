@@ -22,9 +22,11 @@ black level, colour gains, Bayer pattern -- needed to interpret it),
 not PNG: no bit-shifting or scaling happens on the way to disk.
 
 Run this on the Raspberry Pi, with the illumination monitor connected.
-The illumination window goes fullscreen and takes the keyboard, so you
-never need to find the terminal again once it starts: press ENTER on the
-illumination screen to begin, or ESC to abort.
+The illumination window goes fullscreen. To start the run, press ENTER
+either on the illumination screen itself (if a keyboard is plugged into
+the Pi) or in the SSH terminal you launched the script from -- type
+'q' + ENTER in the terminal to abort instead. You never need physical
+access to the Pi once the run starts.
 
 Over SSH you must also tell it which display to draw on:
 
@@ -64,7 +66,7 @@ N_FIRSTON = 16
 # off when the noise is signal-independent (read/thermal), and loses its
 # advantage when photon noise dominates. A single-site frame SHOULD look
 # grainy. If it looks clean, the lab has nothing to show.
-ANALOGUE_GAIN = 4.0
+ANALOGUE_GAIN = 8.0
 EXPOSURE_US = None         # None = set automatically from the ambient level
 AMBIENT_TARGET = 0.30      # aim ambient frames at this fraction of range
 
@@ -221,28 +223,83 @@ class LightStage:
         self.root.update()
 
     def wait_for_key(self, prompt):
-        """Block until Enter is pressed, with the prompt shown on screen.
+        """Block until start is signalled, with the prompt shown on screen.
 
-        The keystroke is read by the illumination window itself rather
-        than by the terminal. With a single monitor the fullscreen window
-        covers the terminal, so asking for a keypress there would mean
-        alt-tabbing blind and leaving a text window sitting in front of
-        the illumination. Returns False if Escape was pressed instead.
+        The signal can come from either of two places:
+
+          - the illumination window itself, via Tk key bindings, for
+            when a keyboard is plugged directly into the Pi; or
+          - the SSH terminal the script was launched from, which is the
+            normal case: the fullscreen illumination window usually
+            doesn't have keyboard focus over SSH (no window manager is
+            giving it focus, and the operator often has no physical
+            keyboard at the Pi at all).
+
+        Terminal input is read on a background daemon thread (a blocking
+        line read on stdin) and handed to the Tk main loop through a
+        queue, which the main loop drains with root.after() polling.
+        Tk objects must only be touched from the Tk thread, so the
+        reader thread never calls into Tk directly -- it just posts
+        strings.
+
+        At the terminal: press ENTER (a blank line) to start, or type
+        'q' then ENTER to abort. On the illumination window: Return /
+        KP_Enter to start, Escape to abort.
+
+        Returns False if aborted.
         """
         state = {"go": False}
+        done = {"flag": False}
+        stdin_q = queue.Queue()
 
         def start(_event=None):
+            if done["flag"]:
+                return
+            done["flag"] = True
             state["go"] = True
             self.root.quit()
 
         def abort(_event=None):
+            if done["flag"]:
+                return
+            done["flag"] = True
             self.root.quit()
+
+        def read_stdin():
+            # Blocking readline loop in a daemon thread. If the user
+            # never types anything this thread just sits here forever,
+            # which is harmless -- it's killed when the process exits.
+            try:
+                for line in sys.stdin:
+                    stdin_q.put(line.strip())
+                    if done["flag"]:
+                        return
+            except Exception:
+                pass
+
+        def poll_stdin():
+            if done["flag"]:
+                return
+            try:
+                line = stdin_q.get_nowait()
+            except queue.Empty:
+                self.root.after(100, poll_stdin)
+                return
+            if line.lower() in ("q", "esc", "abort", "escape"):
+                abort()
+            else:
+                start()
 
         self.message(prompt)
         self.root.bind("<Return>", start)
         self.root.bind("<KP_Enter>", start)
         self.root.bind("<Escape>", abort)
         self.root.focus_force()
+
+        reader = threading.Thread(target=read_stdin, daemon=True)
+        reader.start()
+        self.root.after(100, poll_stdin)
+
         self.root.mainloop()
         self.root.unbind("<Return>")
         self.root.unbind("<KP_Enter>")
@@ -580,14 +637,18 @@ def main():
         print("  exposure %d us, gain %.1f -> ambient %.3f of range"
               % (exposure, args.gain, level))
 
-    # The only keystroke this script asks for, and it is read by the
-    # illumination window, not the terminal. Everything after it runs
-    # unattended, so the rig can be covered and left alone.
-    print("\nCover the rig, then press Enter on the illumination screen.")
+    # The only "keystroke" this script asks for. It can be sent from the
+    # illumination window (if a keyboard is plugged into the Pi) or,
+    # normally, from this SSH terminal: press ENTER here to start, or
+    # type 'q' + ENTER to abort. Everything after it runs unattended,
+    # so the rig can be covered and left alone.
+    print("\nCover the rig, then press ENTER here in the terminal")
+    print("(or on the illumination screen) to start. Type 'q' + ENTER to abort.")
     if not stage.wait_for_key(
-            "Cover the rig, then press ENTER to start.\n\n"
+            "Cover the rig, then press ENTER --\n"
+            "on this screen, or in your SSH terminal -- to start.\n\n"
             "%d frames, about %d minutes.\n"
-            "Press ESC to abort."
+            "Type 'q' + ENTER in the terminal, or press ESC here, to abort."
             % (len(patterns), max(1, round(len(patterns) * SETTLE_S / 60.0)))):
         print("Aborted.")
         stage.close()
