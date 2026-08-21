@@ -61,7 +61,7 @@ N_FIRSTON = 16
 # off when the noise is signal-independent (read/thermal), and loses its
 # advantage when photon noise dominates. A single-site frame SHOULD look
 # grainy. If it looks clean, the lab has nothing to show.
-ANALOGUE_GAIN = 8.0
+ANALOGUE_GAIN = 4.0
 EXPOSURE_US = None         # None = set automatically from the ambient level
 AMBIENT_TARGET = 0.30      # aim ambient frames at this fraction of range
 
