@@ -11,11 +11,15 @@ pattern. The resulting image stacks are what relighting.py consumes.
 
 Five stacks are produced:
 
-    Multiplexed*.png    the multiplexing patterns from H  (needed)
-    Ambient*.png        all sites off                     (needed)
-    Impulse*.png        one site on at a time             (comparison)
-    AllOn*.png          all sites on                      (comparison)
-    FirstOn*.png        only site 1 on                    (comparison)
+    Multiplexed*.dng    the multiplexing patterns from H  (needed)
+    Ambient*.dng        all sites off                     (needed)
+    Impulse*.dng        one site on at a time             (comparison)
+    AllOn*.dng          all sites on                      (comparison)
+    FirstOn*.dng        only site 1 on                    (comparison)
+
+Frames are written as DNG (untouched sensor raw, plus the metadata --
+black level, colour gains, Bayer pattern -- needed to interpret it),
+not PNG: no bit-shifting or scaling happens on the way to disk.
 
 Run this on the Raspberry Pi, with the illumination monitor connected.
 The illumination window goes fullscreen and takes the keyboard, so you
@@ -38,7 +42,6 @@ import argparse
 import threading
 
 import numpy as np
-from PIL import Image
 from scipy.linalg import hadamard
 
 import tkinter as tk
@@ -71,28 +74,23 @@ DISCARD_FRAMES = 2         # frames thrown away after each pattern change
 RAW_BLACK_LEVEL = 64       # OV5647, in 10-bit counts. See report at end.
 RAW_MAX = 1023
 
-# Disk writing. PNG encoding (not the camera) is the dominant cost of a
-# run on a Pi 3B: at full sensor resolution, zlib-compressing one 16-bit
-# frame at PIL's default compress_level (6) can take longer than the
-# settle+discard+capture that produced it. Two changes fix this:
-#
-#   - drop to a cheap compression level. These are lab captures, not a
-#     distribution format, so a slightly bigger PNG costs nothing that
-#     matters, while compress_level=6 -> 1 is typically a 3-5x speedup.
-#   - write on background threads instead of blocking the capture loop.
-#     PIL's PNG encoder does its zlib work in C and releases the GIL
-#     while compressing, so this genuinely uses the Pi 3B's other cores
-#     rather than just interleaving.
-#
-# The queue is bounded so "hold in memory" doesn't turn into "swap to
-# the SD card": WRITE_QUEUE_DEPTH frames in flight at the full raw
-# frame size is at most a few tens of MB, comfortably inside 1GB of
-# RAM. If the writers fall behind, capture() simply blocks on the next
-# queue.put() until a slot frees up -- backpressure instead of an
-# unbounded buildup.
-PNG_COMPRESS_LEVEL = 1
+# Disk writing. Frames are saved as DNG, built from a plain numpy array
+# plus the frame's metadata (black level, colour gains, Bayer pattern),
+# NOT from a live camera "request" object. That distinction matters on
+# a memory-constrained board: a request holds one of the camera's raw
+# buffers until released, and those buffers come out of a small pool
+# of GPU/display-shared memory (CMA), not ordinary RAM. An earlier
+# version of this held requests open for the duration of the (slow)
+# DNG write and raised CAMERA_BUFFER_COUNT to compensate -- which ate
+# into the memory the Wayland/X compositor needs for its own fullscreen
+# surface and crashed the display session. Copying the array out and
+# releasing the request immediately avoids that entirely: the slow
+# part (the actual write) then happens on ordinary heap memory,
+# completely decoupled from camera buffers, so the buffer count can
+# stay as low as the original PNG version's.
+CAMERA_BUFFER_COUNT = 2
 WRITE_WORKERS = 3          # Pi 3B has 4 cores; leave one for capture/Tk
-WRITE_QUEUE_DEPTH = 6
+WRITE_QUEUE_DEPTH = 4
 
 
 # ======================================================================
@@ -284,7 +282,7 @@ def open_camera(exposure_us, gain):
 
     cfg = cam.create_still_configuration(
         raw={"format": "SBGGR10", "size": cam.sensor_resolution},
-        buffer_count=2)
+        buffer_count=CAMERA_BUFFER_COUNT)
     cam.configure(cfg)
     cam.set_controls({
         "AeEnable": False,
@@ -312,6 +310,36 @@ def grab(cam, discard=DISCARD_FRAMES):
         cam.capture_array("raw")
     raw = cam.capture_array("raw")
     return raw.view(np.uint16) if raw.dtype == np.uint8 else raw
+
+
+def grab_capture(cam, discard=DISCARD_FRAMES):
+    """Capture one frame, ready to be saved as DNG later.
+
+    Extracts the pixel array and metadata (black level, colour gains,
+    Bayer pattern, timestamp) from the camera's request and releases
+    the request immediately -- before any of the slow DNG-writing work
+    happens. See the comment above CAMERA_BUFFER_COUNT for why this
+    matters: holding a request open for the duration of a disk write
+    ties up scarce camera/display-shared memory. .copy() is required
+    on the array: make_array() gives a view straight onto the request's
+    buffer, which is only valid until release(), not a value the array
+    can safely outlive on its own.
+
+    Same discard logic as grab(), for the same reason -- the first
+    frame or two after a pattern change can still show the previous
+    pattern.
+    """
+    if cam is None:
+        return None
+    for _ in range(discard):
+        cam.capture_array("raw")
+    request = cam.capture_request()
+    try:
+        array = request.make_array("raw").copy()
+        metadata = request.get_metadata()
+    finally:
+        request.release()
+    return array, metadata
 
 
 def meter(cam, stage, target=AMBIENT_TARGET, gain=ANALOGUE_GAIN):
@@ -398,32 +426,49 @@ def preflight(cam, stage, H):
 # Capture
 # ======================================================================
 
-def save_frame(raw, out_path, name, index, compress_level=PNG_COMPRESS_LEVEL):
-    """Write a raw frame as a 16-bit PNG.
+def save_frame(cam, array, metadata, raw_config, out_path, name, index):
+    """Write a captured frame as a DNG raw file.
 
-    The 10-bit sensor values are shifted into the top of the 16-bit
-    range so that imaging.load_stack's division by 65535 puts them back
-    on [0, 1] in linear units. No gamma, no demosaic, no scaling: the
-    demultiplexing maths needs pixel values proportional to light.
+    Builds the DNG from a plain array + metadata + stream config via
+    Picamera2's helpers.save_dng() -- picamera2's documented way to
+    write a DNG once you're no longer holding the request that produced
+    it (that's the whole point: see the comment above
+    CAMERA_BUFFER_COUNT for why we don't hold requests open here). No
+    bit-shifting or scaling happens: the DNG carries the sensor's own
+    raw counts and its own metadata, and a reader (rawpy, dcraw, etc.)
+    works them out itself.
+
+    NOTE: `cam.helpers` is the picamera2 API this relies on. If your
+    installed picamera2 version doesn't have it, `dir(cam.helpers)` on
+    the Pi will show what's actually available -- the fix then is
+    substituting whatever your version's equivalent free function is,
+    the array/metadata/config extraction in grab_capture() stays the
+    same either way.
     """
-    img = (np.asarray(raw, dtype=np.uint16) << 6)
-    Image.fromarray(img).save(
-        os.path.join(out_path, "%s%03d.png" % (name, index)),
-        compress_level=compress_level)
+    cam.helpers.save_dng(
+        array, metadata, raw_config,
+        os.path.join(out_path, "%s%03d.dng" % (name, index)))
 
 
 class AsyncFrameWriter:
-    """Background PNG writer so capture() never blocks on disk I/O.
+    """Background DNG writer so capture() never blocks on disk I/O.
 
-    capture() hands raw frames off with put() and moves straight on to
-    the next pattern; a small pool of worker threads drains the queue
-    and does the (comparatively slow) PNG encoding concurrently. The
-    queue is bounded, so a slow writer applies backpressure -- put()
-    blocks -- rather than letting frames pile up in RAM.
+    capture() hands off an already-copied (array, metadata) pair with
+    put() and moves straight on to the next pattern; a small pool of
+    worker threads drains the queue and does the DNG write concurrently.
+    Nothing here touches camera buffers -- grab_capture() has already
+    copied the pixels out and released the request before this ever
+    sees the frame -- so the queue can be as deep as memory allows
+    without needing more camera buffers. It's still bounded, so a slow
+    writer applies backpressure (put() blocks) rather than letting
+    frames pile up unboundedly.
     """
 
-    def __init__(self, out_path, n_workers=WRITE_WORKERS, depth=WRITE_QUEUE_DEPTH):
+    def __init__(self, cam, raw_config, out_path,
+                n_workers=WRITE_WORKERS, depth=WRITE_QUEUE_DEPTH):
         os.makedirs(out_path, exist_ok=True)
+        self.cam = cam
+        self.raw_config = raw_config
         self.out_path = out_path
         self.q = queue.Queue(maxsize=depth)
         self.errors = []
@@ -439,18 +484,19 @@ class AsyncFrameWriter:
             if item is None:
                 self.q.task_done()
                 return
-            raw, name, index = item
+            array, metadata, name, index = item
             try:
-                save_frame(raw, self.out_path, name, index)
+                save_frame(self.cam, array, metadata, self.raw_config,
+                          self.out_path, name, index)
             except Exception as err:
                 with self._lock:
                     self.errors.append("%s%03d: %s" % (name, index, err))
             finally:
                 self.q.task_done()
 
-    def put(self, raw, name, index):
-        """Queue a frame for writing. Blocks if the queue is full."""
-        self.q.put((raw, name, index))
+    def put(self, array, metadata, name, index):
+        """Queue a captured frame for writing. Blocks if the queue is full."""
+        self.q.put((array, metadata, name, index))
 
     def pending(self):
         return self.q.qsize()
@@ -471,16 +517,18 @@ class AsyncFrameWriter:
 def capture(cam, stage, patterns, labels, out_path):
     counters = {}
     t0 = time.time()
-    writer = AsyncFrameWriter(out_path) if cam is not None else None
+    raw_config = cam.camera_configuration()["raw"] if cam is not None else None
+    writer = AsyncFrameWriter(cam, raw_config, out_path) if cam is not None else None
 
     for k, (pattern, name) in enumerate(zip(patterns, labels)):
         stage.show(pattern)
         time.sleep(SETTLE_S)
-        raw = grab(cam)
+        captured = grab_capture(cam)
 
         counters[name] = counters.get(name, 0) + 1
-        if raw is not None:
-            writer.put(raw, name, counters[name])
+        if captured is not None:
+            array, metadata = captured
+            writer.put(array, metadata, name, counters[name])
 
         if (k + 1) % 10 == 0 or k + 1 == len(patterns):
             print("  %3d / %3d frames captured  (%.0f s elapsed, %d queued for writing)"
@@ -576,9 +624,11 @@ def main():
         for name in ("Multiplexed", "Ambient", "Impulse", "AllOn", "FirstOn"):
             print("  %-12s %d frames" % (name, counters.get(name, 0)))
         print("\nIn relighting.py set:")
-        print("  DATA_PATH   = %r" % args.out)
-        print("  BLACK_LEVEL = %.5f" % (RAW_BLACK_LEVEL / RAW_MAX))
-        print("  N_SITES     = %d" % N_SITES)
+        print("  DATA_PATH = %r" % args.out)
+        print("  N_SITES   = %d" % N_SITES)
+        print("\nFrames are now .dng, not .png -- load_stack will need a raw")
+        print("reader (e.g. rawpy) instead of PIL, and the black level no")
+        print("longer needs setting by hand: it's in each DNG's own tags.")
     else:
         print("\nRehearsal complete: %d patterns displayed, nothing saved."
               % len(patterns))
