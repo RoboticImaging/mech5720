@@ -1,0 +1,8 @@
+numpy
+scipy
+matplotlib
+Pillow
+opencv-python
+imageio-ffmpeg
+jupyterlab
+ipykernel
